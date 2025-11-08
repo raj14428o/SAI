@@ -1,0 +1,15 @@
+# Ignore secret and environment files
+.env
+*.env
+credentials.json
+*.key
+*.pem
+*.crt
+*.p12
+
+# Ignore common sensitive folders
+__pycache__/
+*.pyc
+.DS_Store
+secrets/
+keys/
