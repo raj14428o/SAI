@@ -5,16 +5,22 @@ import cv2 as cv
 import os
 
 
-haar_cascade = cv.CascadeClassifier(cv.data.haarcascades + "haarcascade_frontalface_default.xml")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+local_cascade = os.path.join(BASE_DIR, "haar_face.xml")
+if os.path.exists(local_cascade):
+    haar_cascade = cv.CascadeClassifier(local_cascade)
+else:
+    haar_cascade = cv.CascadeClassifier(cv.data.haarcascades + "haarcascade_frontalface_default.xml")
 
 if haar_cascade.empty():
-    raise FileNotFoundError("Haar cascade not loaded!")
+    raise FileNotFoundError("Haar cascade could not be loaded!")
 
 
 people = ['Ben Afflek', 'Elton John', 'Jerry Seinfield', 'Madonna', 'Mindy Kaling']
 
 
-model_path = r"D:\SAI\opencv\Faces\face_trained.yml"
+model_path = os.path.join(BASE_DIR, "face_trained.yml")
 if not os.path.exists(model_path):
     raise FileNotFoundError(f"Trained model not found at {model_path}")
 
@@ -22,7 +28,7 @@ face_recognizer = cv.face.LBPHFaceRecognizer_create()
 face_recognizer.read(model_path)
 
 
-img_path = r"D:\SAI\opencv\Resources\Faces\val\elton_john\1.jpg"
+img_path = os.path.join(BASE_DIR, "..", "Resources", "Faces", "val", "elton_john", "1.jpg")
 if not os.path.exists(img_path):
     raise FileNotFoundError(f"Image not found at {img_path}")
 

@@ -4,10 +4,14 @@ import os
 import cv2 as cv
 import numpy as np
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 people = ['Ben Afflek', 'Elton John', 'Jerry Seinfield', 'Madonna', 'Mindy Kaling']
-DIR = r'..Media Files\Faces\train'
+DIR = os.path.join(BASE_DIR, '..', 'Resources', 'Faces', 'train')
 
-haar_cascade = cv.CascadeClassifier('haar_face.xml')
+cascade_path = os.path.join(BASE_DIR, 'haar_face.xml')
+haar_cascade = cv.CascadeClassifier(cascade_path)
+if haar_cascade.empty():
+    raise FileNotFoundError(f"Haar cascade could not be loaded from {cascade_path}")
 
 features = []
 labels = []
@@ -44,6 +48,6 @@ face_recognizer = cv.face.LBPHFaceRecognizer_create()
 # Train the Recognizer on the features list and the labels list
 face_recognizer.train(features,labels)
 
-face_recognizer.save('face_trained.yml')
-np.save('features.npy', features)
-np.save('labels.npy', labels)
+face_recognizer.save(os.path.join(BASE_DIR, 'face_trained.yml'))
+np.save(os.path.join(BASE_DIR, 'features.npy'), features)
+np.save(os.path.join(BASE_DIR, 'labels.npy'), labels)
