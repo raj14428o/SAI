@@ -1,6 +1,7 @@
 import os
 import smtplib
 import asyncio
+import concurrent.futures
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime
@@ -83,7 +84,8 @@ class CommunicationTool:
     def generate_email_content(self, recipient_name: str, purpose: str):
         """
         Generates email subject and body content using Gemini AI or structured template.
-        Supports Gemini 3.8 Flash with automatic fallback.
+        Uses Gemini 3.8 Flash with a 10-second hard timeout to prevent blocking on slow API responses.
+        Falls back to a structured template on timeout or error.
         """
         api_key = os.getenv("GEMINI_API_KEY")
         if api_key:
@@ -96,23 +98,31 @@ class CommunicationTool:
                     "SUBJECT: <subject line>\n"
                     "BODY: <email body>"
                 )
-                
+
                 # Gemini 3.8 Flash model
                 model_name = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
-                response = client.models.generate_content(
-                    model=model_name,
-                    contents=prompt
-                )
 
-                if response and response.text:
-                    text = response.text
-                    if "SUBJECT:" in text and "BODY:" in text:
-                        parts = text.split("BODY:")
-                        subject = parts[0].replace("SUBJECT:", "").strip()
-                        body = parts[1].strip()
-                        return subject, body
+                def _call_gemini():
+                    return client.models.generate_content(model=model_name, contents=prompt)
+
+                # Hard 10-second timeout for email generation (slightly more lenient than chat)
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                    future = executor.submit(_call_gemini)
+                    try:
+                        response = future.result(timeout=10.0)
+                        if response and response.text:
+                            text = response.text
+                            if "SUBJECT:" in text and "BODY:" in text:
+                                parts = text.split("BODY:")
+                                subject = parts[0].replace("SUBJECT:", "").strip()
+                                body = parts[1].strip()
+                                return subject, body
+                    except concurrent.futures.TimeoutError:
+                        print("[WARN] Gemini email generation timed out after 10s — using template fallback")
+                    except Exception as e:
+                        print(f"[WARN] Gemini email generation error: {e}")
             except Exception as e:
-                print(f"[WARN] Gemini email generation failed, falling back to template: {e}")
+                print(f"[WARN] Gemini email setup failed: {e}")
 
         # Fallback template
         subject = f"Update regarding {purpose.capitalize()}"

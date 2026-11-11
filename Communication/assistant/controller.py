@@ -1,10 +1,16 @@
 import os
 import sys
 import asyncio
+import concurrent.futures
 import cv2
 import time
 import datetime
 import re
+
+# Add Communication directory to sys.path so modules and voice are always importable
+COMM_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if COMM_DIR not in sys.path:
+    sys.path.insert(0, COMM_DIR)
 
 from modules.communication_tool import CommunicationTool
 from voice.speech_output import SpeechOutput
@@ -67,8 +73,9 @@ class AllyController:
     def answer_conversational(self, query: str):
         """
         Answers any open-ended question or conversational remark freely.
-        Uses Gemini 3.8 Flash if GEMINI_API_KEY is available in .env,
-        or an intelligent conversational fallback engine.
+        Queries Gemini 3.8 Flash with adequate time (18s timeout) and an automatic retry
+        to ensure it only falls back if the request genuinely failed or could not connect.
+        Falls back to a natural local conversational response if Gemini is unavailable.
         """
         api_key = os.getenv("GEMINI_API_KEY")
         if api_key:
@@ -76,29 +83,43 @@ class AllyController:
                 from google import genai
                 client = genai.Client(api_key=api_key)
                 prompt = (
-                    "You are Ally, a helpful, intelligent voice companion and AI vision assistant for Vision Mate. "
+                    "You are Ally, a helpful, intelligent voice companion and vision assistant for Vision Mate. "
                     "The user is speaking to you via a microphone. Respond conversationally, naturally, and warmly "
                     "in 1 to 2 spoken sentences. Do not use markdown, asterisks, or lists.\n\n"
                     f"User: {query}"
                 )
-                
-                # Gemini 3.8 Flash model
+
                 model_name = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
-                response = client.models.generate_content(
-                    model=model_name,
-                    contents=prompt
-                )
 
-                if response and response.text:
-                    text = response.text.strip().replace("*", "").replace("#", "").replace('"', '')
-                    if text:
-                        print(f"[Gemini AI Spoken]: {text}")
-                        self.voice_out.speak(text)
-                        return
+                def _call_gemini():
+                    return client.models.generate_content(model=model_name, contents=prompt)
+
+                # Attempt up to 2 times with an 18-second timeout each to ensure it genuinely failed
+                for attempt in range(2):
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                        future = executor.submit(_call_gemini)
+                        try:
+                            response = future.result(timeout=18.0)
+                            if response and response.text:
+                                text = response.text.strip().replace("*", "").replace("#", "").replace('"', '')
+                                if text:
+                                    print(f"[Gemini Spoken]: {text}")
+                                    self.voice_out.speak(text)
+                                    return
+                        except concurrent.futures.TimeoutError:
+                            print(f"[WARN] Gemini call timed out on attempt {attempt + 1}")
+                            if attempt == 0:
+                                time.sleep(0.5)
+                                continue
+                        except Exception as e:
+                            print(f"[WARN] Gemini error on attempt {attempt + 1}: {e}")
+                            if attempt == 0:
+                                time.sleep(0.5)
+                                continue
             except Exception as e:
-                print(f"[WARN] Gemini chat fallback: {e}")
+                print(f"[WARN] Gemini client setup failed: {e}")
 
-        # Local intelligent conversational fallback
+        # Natural local conversational fallback
         now = datetime.datetime.now()
         q = query.lower()
 
@@ -107,20 +128,19 @@ class AllyController:
         elif any(w in q for w in ("date", "today", "what day")):
             self.voice_out.speak(f"Today is {now.strftime('%A, %B %d, %Y')}.")
         elif any(w in q for w in ("hello", "hi", "hey", "good morning", "good evening", "good afternoon")):
-            self.voice_out.speak("Hello! I am Vision Mate, your visual companion. How can I assist you?")
+            self.voice_out.speak("Hello! I am Vision Mate. How can I help you?")
         elif "how are you" in q:
-            self.voice_out.speak("I am doing great and all visual sensors and assistant tools are ready! What would you like to do?")
+            self.voice_out.speak("I am doing great and all sensors are ready. What would you like to do?")
         elif any(w in q for w in ("what can you do", "help", "features", "who are you", "your name")):
             self.voice_out.speak(
                 "I can guide your walking path with depth sensors, identify people in front of you, "
-                "draft and send emails with AI, check weather, manage reminders and notes, and chat with you freely!"
+                "draft and send emails, check the weather, manage reminders and notes, and answer questions."
             )
         elif "thank" in q:
             self.voice_out.speak("You're very welcome! Let me know if you need anything else.")
         else:
             self.voice_out.speak(
-                f"I heard you say: {query}. To unlock live AI answers for any general question, "
-                f"you can add a free Gemini API key to your .env file. You can also ask me for weather, reminders, walking navigation, or emails!"
+                "I didn't quite catch that or couldn't reach the answer right now. Could you please say that again?"
             )
 
     def identify_person_in_camera(self):
@@ -147,6 +167,98 @@ class AllyController:
             return "There is an unknown person in front of you."
 
     async def run_walking_mode(self, max_seconds=120):
+        """
+        Activates continuous walking navigation using MiDaS depth & SSD MobileNet.
+        Provides stabilized, actionable movement instructions ('Move left', 'Stop', etc.).
+        While navigating the user can interrupt with voice commands (e.g., "stop walking",
+        "pause", "resume walking").  The loop will break on interruption, returning control
+        to the main command processor so the user can request other actions (email, face ID,
+        etc.).  To continue walking the user simply says a walking keyword again.
+        """
+        self.voice_out.speak("Walking mode active. Monitoring obstacles. Say ‘stop walking’ to pause.")
+        time.sleep(1.0)
+
+        frozen_model = os.path.join(OBSTACLE_DIR, "frozen_inference_graph.pb")
+        config_file  = os.path.join(OBSTACLE_DIR, "ssd_mobilenet_v3_large_coco_2020_01_14.pbtxt")
+        labels_file  = os.path.join(OBSTACLE_DIR, "coco.names")
+
+        with open(labels_file, "rt") as f:
+            class_labels = f.read().rstrip("\n").split("\n")
+
+        model = cv2.dnn_DetectionModel(frozen_model, config_file)
+        model.setInputSize(320, 320)
+        model.setInputScale(1.0 / 127.5)
+        model.setInputMean((127.5, 127.5, 127.5))
+        model.setInputSwapRB(True)
+
+        cap = cv2.VideoCapture(0)
+        if not cap.isOpened():
+            self.voice_out.speak("Error opening camera for walking mode.")
+            return
+
+        start_time = time.time()
+        nav_engine = NavigationEngine(speech_cooldown=3.0)
+
+        try:
+            while time.time() - start_time < max_seconds:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+
+                # ---- Vision pipeline ----
+                depth_map, depth_colored = self.depth_estimator.estimate_depth(frame)
+                classIndex, confidence, bbox = model.detect(frame, confThreshold=0.48)
+
+                frame_h, frame_w = frame.shape[:2]
+                detected_obstacles = []
+
+                if len(classIndex) != 0:
+                    for classInd, conf, box in zip(classIndex.flatten(), confidence.flatten(), bbox):
+                        label_name = class_labels[classInd - 1] if 0 < classInd <= len(class_labels) else "object"
+                        dist_m, status, status_color = self.depth_estimator.get_object_distance(depth_map, box)
+                        detected_obstacles.append({
+                            "label": label_name,
+                            "dist": dist_m,
+                            "box": box,
+                            "confidence": float(conf)
+                        })
+                        cv2.rectangle(frame, box, status_color, 2)
+                        cv2.putText(frame, f"{label_name.upper()} {dist_m}m", (box[0], max(20, box[1] - 8)),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, status_color, 2)
+
+                # ---- Navigation update & speech ----
+                instruction, hud_status, hud_color, is_urgent = nav_engine.update(detected_obstacles, frame_w)
+                if nav_engine.should_speak(instruction, is_urgent):
+                    self.voice_out.speak(instruction, priority=is_urgent)
+
+                # ---- HUD overlay ----
+                cv2.rectangle(frame, (0, 0), (frame_w, 42), (20, 20, 20), -1)
+                cv2.putText(frame, f"STATUS: {hud_status}", (15, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.65, hud_color, 2)
+                cv2.rectangle(frame, (0, 42), (frame_w, 70), (40, 40, 40), -1)
+                cv2.putText(frame, f"COMMAND: {instruction}", (15, 62), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
+
+                cv2.imshow("Vision Mate - Walking Mode Navigation", frame)
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
+
+                # ---- Voice interruption check (non‑blocking) ----
+                # Small timeout so navigation stays responsive
+                interrupt = self.voice_in.listen_command(timeout=0.5, phrase_limit=12)
+                if interrupt:
+                    cmd = interrupt.lower()
+                    if "stop walking" in cmd or "pause" in cmd:
+                        self.voice_out.speak("Navigation paused. You can ask for other actions now.")
+                        break  # exit walking loop, return to main command processor
+                    # Optional: allow a quick "status" query
+                    if "status" in cmd:
+                        self.voice_out.speak(f"Current instruction: {instruction}.")
+
+        finally:
+            cap.release()
+            cv2.destroyAllWindows()
+            self.voice_out.speak("Walking mode exited.")
+            time.sleep(0.5)
+
         """
         Activates continuous walking navigation using MiDaS depth & SSD MobileNet.
         Provides stabilized, actionable movement instructions ('Move left', 'Stop', etc.).
@@ -365,11 +477,11 @@ class AllyController:
             if not purpose:
                 purpose = "General catch-up and check-in"
 
-            self.voice_out.speak("Drafting the email with AI. Please wait.")
+            self.voice_out.speak("Drafting the email. Please wait.")
             time.sleep(0.4)
             subject, body = self.comm_tool.generate_email_content(person, purpose)
 
-            print(f"[AI Draft Subject]: {subject}\n[AI Draft Body]:\n{body}")
+            print(f"[Draft Subject]: {subject}\n[Draft Body]:\n{body}")
             self.voice_out.speak(f"I drafted an email with subject: {subject}. Would you like me to send it?")
             confirm = self._ask_voice("Say yes to send, or cancel to abort.")
 
